@@ -84,7 +84,7 @@ Sample scan result with client count per BSSID after 3 seconds of sniffing each:
 
 ---
 
-MIT License
+Apache License 2.0 – see [`LICENSE`](LICENSE) file for full details.
 ---
 
 ## 🛠️ TODO
