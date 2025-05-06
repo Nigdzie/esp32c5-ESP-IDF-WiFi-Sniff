@@ -1,0 +1,17 @@
+{
+    "idf.portWin": "COM22",
+    "idf.flashType": "UART",
+    "idf.cmakeBuildType": "Debug",
+    "idf.compileCommandsPath": "${workspaceFolder}/build/compile_commands.json",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32c5"
+    },
+    "idf.espIdfPathWin": "C:\\Users\\Pred\\esp\\master\\esp-idf",
+    "idf.toolsPathWin": "C:\\Users\\Pred\\.espressif",
+    "idf.pythonInstallPath": "C:\\Users\\Pred\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+    "idf.monitorPort": "COM22",
+    "idf.openOcdConfigs": [
+        "board/esp32c5-builtin.cfg"
+    ]
+}
