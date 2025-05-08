@@ -13,5 +13,8 @@
     "idf.monitorPort": "COM22",
     "idf.openOcdConfigs": [
         "board/esp32c5-builtin.cfg"
-    ]
+    ],
+    "files.associations": {
+        "esp_timer.h": "c"
+    }
 }

@@ -10,11 +10,25 @@
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_spiffs.h" 
+
+#include "st7735s.h"
+#include "fontx.h"
 
 #define TAG "WiFiScanner"
 #define MAX_APS 10
 #define MAX_CLIENTS 10
 #define SNIFF_TIME_MS 3000
+
+#define TFT_CS     3
+#define TFT_DC     5
+#define TFT_RST    4
+#define TFT_BLK    2
+#define TFT_SCLK   10
+#define TFT_MOSI   7
+
+TFT_t dev;
+FontxFile fx[2];
 
 typedef struct {
     uint8_t bssid[6];
@@ -44,7 +58,7 @@ static void wifi_sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
     const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buf;
     const uint8_t *payload = ppkt->payload;
 
-    if ((payload[0] & 0x0C) == 0x08) { // data frame
+    if ((payload[0] & 0x0C) == 0x08) {
         const uint8_t *src_mac = payload + 10;
         const uint8_t *bssid = payload + 16;
 
@@ -58,6 +72,34 @@ static void wifi_sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
                 }
             }
         }
+    }
+}
+
+void display_results() {
+    lcdFillScreen(&dev, BLACK);
+    lcdSetFontDirection(&dev, 0);
+    lcdDrawString(&dev, fx, 0, 10, (uint8_t *)"SSID", CYAN);
+
+    for (int i = 0; i < ap_list_count && i < 10; i++) {
+        char line[64];
+        snprintf(line, sizeof(line), "%2d. %-10s %2dcl %ddBm", i + 1, ap_list[i].ssid, ap_list[i].client_count, ap_list[i].rssi);
+        lcdDrawString(&dev, fx, 0, 20 + i * 12, (uint8_t *)line, WHITE);
+    }
+
+    printf("\n| %-17s | %-4s | %-5s | %-6s | %-17s |\n", "SSID", "Band", "Chan", "Clients", "BSSID");
+    printf("|-------------------|------|-------|--------|-------------------|\n");
+    for (int i = 0; i < ap_list_count; i++) {
+        const char *band = "???";
+        uint8_t ch = ap_list[i].channel;
+
+        if (ch >= 1 && ch <= 14) band = "2.4G";
+        else if (ch >= 36 && ch <= 165) band = "5G";
+        else if (ch >= 1 && ch <= 233) band = "6G";
+
+        printf("| %-17s | %-4s | %-5d | %-6d | %02X:%02X:%02X:%02X:%02X:%02X |\n",
+            ap_list[i].ssid, band, ch, ap_list[i].client_count,
+            ap_list[i].bssid[0], ap_list[i].bssid[1], ap_list[i].bssid[2],
+            ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5]);
     }
 }
 
@@ -95,11 +137,10 @@ void wifi_scan_task(void *pvParameters) {
         esp_wifi_set_promiscuous(true);
         esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_callback);
 
-        // Sniff each AP for a configurable duration
         for (int i = 0; i < ap_list_count; i++) {
             sniffing = false;
             esp_wifi_set_channel(ap_list[i].channel, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(100)); // settle on channel
+            vTaskDelay(pdMS_TO_TICKS(100));
             sniffing = true;
             vTaskDelay(pdMS_TO_TICKS(SNIFF_TIME_MS));
             sniffing = false;
@@ -107,36 +148,32 @@ void wifi_scan_task(void *pvParameters) {
         }
 
         esp_wifi_set_promiscuous(false);
+        display_results();
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
 
-        printf("\n| %-17s | %-4s | %-5s | %-6s | %-17s |\n", "SSID", "Band", "Chan", "Clients", "BSSID");
-        printf("|-------------------|------|-------|--------|-------------------|\n");
+void init_spiffs() {
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "spiffs",
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
 
-        for (int i = 0; i < ap_list_count; i++) {
-            const char *band = "???";
-            uint8_t ch = ap_list[i].channel;
-
-            if (ch >= 1 && ch <= 14) {
-                band = "2.4G";
-            } else if (ch >= 36 && ch <= 165) {
-                band = "5G";
-            } else if (ch >= 1 && ch <= 233) {
-                band = "6G"; // if supported
-            }
-
-            printf("| %-17s | %-4s | %-5d | %-6d | %02X:%02X:%02X:%02X:%02X:%02X |\n",
-                   ap_list[i].ssid,
-                   band,
-                   ch,
-                   ap_list[i].client_count,
-                   ap_list[i].bssid[0], ap_list[i].bssid[1], ap_list[i].bssid[2],
-                   ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5]);
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount or format SPIFFS (%s)", esp_err_to_name(ret));
+    } else {
+        size_t total = 0, used = 0;
+        if (esp_spiffs_info("spiffs", &total, &used) == ESP_OK) {
+            ESP_LOGI(TAG, "SPIFFS mounted: total=%d, used=%d", total, used);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(60000)); // wait 60 sec before next full cycle
     }
 }
 
 void app_main(void) {
+    init_spiffs();
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -145,6 +182,12 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    spi_master_init(&dev, TFT_MOSI, TFT_SCLK, TFT_CS, TFT_DC, TFT_RST);
+    lcdInit(&dev, 128, 160, 2, 1, false);
+    lcdFillScreen(&dev, BLACK);
+
+    InitFontx(fx, "/spiffs/fontx/ILGH16XB.FNT", "");
 
     xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
 }
