@@ -76,6 +76,38 @@ Sample scan result with client count per BSSID after 3 seconds of sniffing each:
 
 ---
 
+## 🧭 Optional: GPS Integration (ATGM336H)
+
+This project optionally supports **GPS position logging** via the **ATGM336H** module.  
+The device outputs NMEA sentences (e.g. `$GPGGA`) over UART and a PPS signal for accurate timing.
+
+### 🔌 Wiring (ESP32-C5 DevKitC-1)
+
+| GPS Pin   | Connect to ESP32-C5 |
+|-----------|---------------------|
+| **TX**    | GPIO24              |
+| **PPS**   | GPIO23              |
+| **VCC**   | 3.3V                |
+| **GND**   | GND                 |
+| **RX**    | _Not connected_     |
+
+> 📌 Only GPS TX (UART output) and PPS (Pulse-Per-Second) are used. GPS RX is not required.
+
+### ⚙️ Features
+
+- Automatically detects if GPS is present and active
+- Displays latest latitude/longitude if available
+- Shows last PPS timestamp (in milliseconds)
+- If GPS is not detected, displays "GPS: N/A"
+
+### 💡 Notes
+
+- UART baud rate: **9600**
+- PPS signal must be active (1 pulse per second) on rising edge
+- GPS fix may take time (especially indoors)
+
+---
+
 ## 📍 Notes
 
 - Limited to max 10 APs and 10 clients per BSSID (changeable via `#define`)
@@ -84,11 +116,14 @@ Sample scan result with client count per BSSID after 3 seconds of sniffing each:
 
 ---
 
-Apache License 2.0 – see [`LICENSE`](LICENSE) file for full details.
----
-
 ## 🛠️ TODO
 
 - [ ] Display summary on 1.8" SPI TFT screen (ST7735S)
 - [ ] Add rotary encoder support for navigating results
 - [ ] Live update of top APs with most clients
+- [X] GPS support
+
+
+
+Apache License 2.0 – see [`LICENSE`](LICENSE) file for full details.
+---
