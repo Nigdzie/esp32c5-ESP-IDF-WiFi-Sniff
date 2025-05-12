@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
@@ -12,15 +13,18 @@
 #include "esp_timer.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 
 #define TAG "WiFiScanner"
 #define MAX_APS 10
 #define MAX_CLIENTS 10
 #define SNIFF_TIME_MS 3000
-
 #define GPS_UART_NUM UART_NUM_1
 #define GPS_RXD 24
 #define PPS_GPIO 23
+#define RETAIN_CLIENTS_HISTORY 1 // set to 0 to clear client list each scan
+#define SORT_RESULTS_BY_RSSI 1   // set to 0 to disable RSSI-based sorting
 
 static char gps_sentence[128] = {0};
 static float last_lat = 0.0, last_lon = 0.0;
@@ -28,18 +32,18 @@ static bool gps_available = false;
 static int64_t last_pps_time_us = 0;
 
 typedef struct {
-    uint8_t bssid[6];
+    char ssid[33];
     uint8_t channel;
     int rssi;
-    char ssid[33];
+    uint8_t bssid[6];
     int client_count;
-    uint8_t clients[MAX_CLIENTS][6];
-    int client_index;
-} ap_info_t;
+    wifi_auth_mode_t authmode;
+} scan_result_t;
 
-static ap_info_t ap_list[MAX_APS];
-static int ap_list_count = 0;
-static bool sniffing = false;
+static scan_result_t ap_results[MAX_APS];
+static int ap_result_count = 0;
+static uint8_t client_macs[MAX_APS][MAX_CLIENTS][6];
+static int client_counts[MAX_APS] = {0};
 
 static void IRAM_ATTR pps_isr_handler(void* arg) {
     last_pps_time_us = esp_timer_get_time();
@@ -129,36 +133,75 @@ static void poll_gps_data(void) {
     }
 }
 
-static bool mac_in_list(uint8_t clients[][6], int count, const uint8_t *mac) {
+static bool mac_in_list(uint8_t (*list)[6], int count, const uint8_t *mac) {
     for (int i = 0; i < count; i++) {
-        if (memcmp(clients[i], mac, 6) == 0) {
+        if (memcmp(list[i], mac, 6) == 0) {
             return true;
         }
     }
     return false;
 }
 
-static void print_scan_header(void) {
-    printf("\n| %-17s | %-4s | %-5s | %-6s | %-17s | %-12s | %-12s | %-10s |\n",
-           "SSID", "Band", "Chan", "Clients", "BSSID", "Latitude", "Longitude", "PPS [ms]");
-    printf("|-------------------|------|-------|--------|-------------------|--------------|--------------|------------|\n");
+static void wifi_sniffer_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (type != WIFI_PKT_DATA) return;
+    const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *payload = pkt->payload;
+
+    const uint8_t *bssid = payload + 10;
+    const uint8_t *src = payload + 16;
+
+    for (int i = 0; i < ap_result_count; i++) {
+        if (memcmp(ap_results[i].bssid, bssid, 6) == 0) {
+            if (!mac_in_list(client_macs[i], client_counts[i], src) && client_counts[i] < MAX_CLIENTS) {
+                memcpy(client_macs[i][client_counts[i]], src, 6);
+                client_counts[i]++;
+                ap_results[i].client_count = client_counts[i];
+            }
+            break;
+        }
+    }
 }
 
-static void print_scan_entry(const ap_info_t *ap) {
-    const char *band = "???";
-    if (ap->channel >= 1 && ap->channel <= 14) band = "2.4G";
-    else if (ap->channel >= 36 && ap->channel <= 165) band = "5G";
-    else if (ap->channel >= 1 && ap->channel <= 233) band = "6G";
+static int compare_rssi(const void *a, const void *b) {
+    const scan_result_t *ra = (const scan_result_t *)a;
+    const scan_result_t *rb = (const scan_result_t *)b;
+    return rb->rssi - ra->rssi;
+}
 
-    char lat_buf[16], lon_buf[16], pps_buf[16];
-    snprintf(lat_buf, sizeof(lat_buf), gps_available ? "%.5f" : "GPS: N/A", last_lat);
-    snprintf(lon_buf, sizeof(lon_buf), gps_available ? "%.5f" : "GPS: N/A", last_lon);
-    snprintf(pps_buf, sizeof(pps_buf), gps_available ? "%lld" : "N/A", last_pps_time_us / 1000);
+static void print_scan_results(void) {
+    if (SORT_RESULTS_BY_RSSI && ap_result_count > 1) {
+        qsort(ap_results, ap_result_count, sizeof(scan_result_t), compare_rssi);
+    }
 
-    printf("| %-17s | %-4s | %-5d | %-6d | %02X:%02X:%02X:%02X:%02X:%02X | %-12s | %-12s | %-10s |\n",
-           ap->ssid, band, ap->channel, ap->client_count,
-           ap->bssid[0], ap->bssid[1], ap->bssid[2], ap->bssid[3], ap->bssid[4], ap->bssid[5],
-           lat_buf, lon_buf, pps_buf);
+    printf("\n| %-25s | %-4s | %-5s | %-6s | %-4s | %-17s | %-10s | %-12s | %-12s | %-10s |\n",
+           "SSID", "Band", "Chan", "RSSI", "Cli", "BSSID", "Security", "Latitude", "Longitude", "PPS [ms]");
+    printf("|---------------------------|------|-------|--------|------|-------------------|------------|--------------|--------------|------------|\n");
+
+    for (int i = 0; i < ap_result_count; i++) {
+        const char *band = (ap_results[i].channel <= 14) ? "2.4G" : "5G";
+
+        char lat_buf[16], lon_buf[16], pps_buf[16];
+        snprintf(lat_buf, sizeof(lat_buf), gps_available ? "%.5f" : "GPS: N/A", last_lat);
+        snprintf(lon_buf, sizeof(lon_buf), gps_available ? "%.5f" : "GPS: N/A", last_lon);
+        snprintf(pps_buf, sizeof(pps_buf), gps_available ? "%lld" : "N/A", last_pps_time_us / 1000);
+
+        const char *auth_mode = "OPEN";
+        switch (ap_results[i].authmode) {
+            case WIFI_AUTH_WEP: auth_mode = "WEP"; break;
+            case WIFI_AUTH_WPA_PSK: auth_mode = "WPA"; break;
+            case WIFI_AUTH_WPA2_PSK: auth_mode = "WPA2"; break;
+            case WIFI_AUTH_WPA_WPA2_PSK: auth_mode = "WPA/WPA2"; break;
+            case WIFI_AUTH_WPA3_PSK: auth_mode = "WPA3"; break;
+            case WIFI_AUTH_WPA2_WPA3_PSK: auth_mode = "WPA2/WPA3"; break;
+            default: break;
+        }
+
+        printf("| %-25s | %-4s | %-5d | %-6d | %-4d | %02X:%02X:%02X:%02X:%02X:%02X | %-10s | %-12s | %-12s | %-10s |\n",
+               ap_results[i].ssid, band, ap_results[i].channel, ap_results[i].rssi, ap_results[i].client_count,
+               ap_results[i].bssid[0], ap_results[i].bssid[1], ap_results[i].bssid[2],
+               ap_results[i].bssid[3], ap_results[i].bssid[4], ap_results[i].bssid[5],
+               auth_mode, lat_buf, lon_buf, pps_buf);
+    }
 }
 
 void wifi_scan_task(void *pvParameters) {
@@ -172,46 +215,46 @@ void wifi_scan_task(void *pvParameters) {
     while (1) {
         poll_gps_data();
 
+        size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        ESP_LOGI(TAG, "Free heap before scan: %d bytes", free_heap);
+
         esp_wifi_set_promiscuous(false);
         esp_wifi_scan_start(&scan_cfg, true);
 
-        uint16_t count = MAX_APS;
         wifi_ap_record_t results[MAX_APS] = {0};
-        if (esp_wifi_scan_get_ap_records(&count, results) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to get scan results");
-            vTaskDelay(pdMS_TO_TICKS(30000));
-            continue;
+        uint16_t count = MAX_APS;
+        if (esp_wifi_scan_get_ap_records(&count, results) == ESP_OK) {
+            ap_result_count = 0;
+            for (int i = 0; i < count && ap_result_count < MAX_APS; i++) {
+                scan_result_t *entry = &ap_results[ap_result_count];
+                strncpy(entry->ssid, (char *)results[i].ssid, sizeof(entry->ssid) - 1);
+                entry->ssid[32] = '\0';
+                entry->channel = results[i].primary;
+                entry->rssi = results[i].rssi;
+                memcpy(entry->bssid, results[i].bssid, 6);
+                entry->authmode = results[i].authmode;
+                if (!RETAIN_CLIENTS_HISTORY) {
+                    memset(client_macs[ap_result_count], 0, sizeof(client_macs[ap_result_count]));
+                    client_counts[ap_result_count] = 0;
+                }
+                entry->client_count = client_counts[ap_result_count];
+                ap_result_count++;
+            }
         }
 
-        ap_list_count = count < MAX_APS ? count : MAX_APS;
-        for (int i = 0; i < ap_list_count; i++) {
-            memcpy(ap_list[i].bssid, results[i].bssid, 6);
-            ap_list[i].channel = results[i].primary;
-            ap_list[i].rssi = results[i].rssi;
-            strncpy(ap_list[i].ssid, (char*)results[i].ssid, sizeof(ap_list[i].ssid) - 1);
-            ap_list[i].ssid[32] = '\0';
-            ap_list[i].client_index = 0;
-        }
-
+        esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_callback);
         esp_wifi_set_promiscuous(true);
-        esp_wifi_set_promiscuous_rx_cb(NULL);
 
-        for (int i = 0; i < ap_list_count; i++) {
-            sniffing = false;
-            esp_wifi_set_channel(ap_list[i].channel, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            sniffing = true;
+        for (int i = 0; i < ap_result_count; i++) {
+            esp_wifi_set_channel(ap_results[i].channel, WIFI_SECOND_CHAN_NONE);
             vTaskDelay(pdMS_TO_TICKS(SNIFF_TIME_MS));
-            sniffing = false;
-            ap_list[i].client_count = ap_list[i].client_index;
         }
 
         esp_wifi_set_promiscuous(false);
+        print_scan_results();
 
-        print_scan_header();
-        for (int i = 0; i < ap_list_count; i++) {
-            print_scan_entry(&ap_list[i]);
-        }
+        free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+        ESP_LOGI(TAG, "Free heap after scan: %d bytes", free_heap);
 
         vTaskDelay(pdMS_TO_TICKS(60000));
     }
@@ -226,8 +269,8 @@ void app_main(void) {
     init_pps_gpio();
     gps_available = detect_gps_presence();
 
-    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
