@@ -39,23 +39,30 @@ Make sure the board is in download mode and connected to the right COM port (`id
 
 ---
 
-## 📡 Output Example
+### 🔍 Advanced Wi-Fi Scanning
 
-Sample scan result with client count per BSSID after 3 seconds of sniffing each:
+The sniffer now supports additional features:
 
+- ✅ **GPS Integration (ATGM336H):** If detected, each scan result includes geographic coordinates (latitude & longitude).  
+- ✅ **PPS Pin Support:** Pulse-per-second (1PPS) from GPS is logged and used for millisecond-level timestamping.
+- ✅ **Client Detection per BSSID:** Promiscuous mode captures data packets to count connected Wi-Fi clients.
+- ✅ **Rolling Client History:** Optionally retain client MACs across scans.
+- ✅ **Signal Strength (RSSI):** Each AP shows real-time signal level.
+- ✅ **Security Type Detection:** Authentication method is displayed per network (e.g., WPA2, WPA3, OPEN).
+- ✅ **Optional Sorting:** Results can be sorted by signal strength via `#define SORT_BY_SIGNAL 1`.
+
+You can toggle some features at compile-time:
+
+```c
+#define RETAIN_CLIENTS_HISTORY 1  // 0 = clear clients on each scan
+#define SORT_BY_SIGNAL 1          // 1 = sort scan results by RSSI
 ```
-| SSID              | Band | Chan  | Clients | BSSID             |
-|-------------------|------|-------|---------|-------------------|
-| Home5G            | 5G   | 128   | 0       | 7C:2B:8F:AA:BB:01 |
-|                   | 5G   | 128   | 1       | 7C:2B:8F:AA:BB:02 |
-|                   | 5G   | 128   | 1       | 7C:2B:8F:AA:BB:03 |
-|                   | 5G   | 128   | 0       | 7C:2B:8F:AA:BB:04 |
-|                   | 5G   | 128   | 0       | 7C:2B:8F:AA:BB:05 |
-| Home2.4G          | 2.4G | 11    | 0       | 7C:2B:8F:AA:BC:01 |
-|                   | 2.4G | 11    | 2       | 7C:2B:8F:AA:BC:02 |
-|                   | 2.4G | 11    | 1       | 7C:2B:8F:AA:BC:03 |
-|                   | 2.4G | 11    | 0       | 7C:2B:8F:AA:BC:04 |
-|                   | 2.4G | 11    | 0       | 7C:2B:8F:AA:BC:05 |
+
+Output example:
+```
+| SSID           | Band | Chan | RSSI  | Cli | BSSID             | Security  | Latitude   | Longitude  | PPS [ms] |
+|----------------|------|------|-------|-----|-------------------|-----------|------------|------------|----------|
+| MyWiFi         | 5G   | 128  | -49   | 4   | 9A:2A:6F:...:DD   | WPA2/WPA3 | 51.12345   | 17.12345   | 5432     |
 ```
 
 ---
