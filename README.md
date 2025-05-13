@@ -3,6 +3,7 @@
 > This is a **proof-of-concept** project that demonstrates how to passively detect Wi-Fi clients near ESP32-C5 using promiscuous mode.  
 > Use responsibly. In many jurisdictions, **sniffing Wi-Fi traffic** may require **authorization** or **consent** from network owners. This code is for **educational purposes only**.
 
+---
 
 ## ESP32-C5 WiFi Client Sniffer
 
@@ -35,102 +36,112 @@ idf.py --preview set-target esp32c5
 idf.py fullclean build flash monitor
 ```
 
-Make sure the board is in download mode and connected to the right COM port (`idf.py -p COMx ...`).
+Make sure the board is in download mode and connected to the correct COM port (`idf.py -p COMx ...`).
 
 ---
 
-### 🔍 Advanced Wi-Fi Scanning
+## 🔍 Advanced Wi-Fi Scanning
 
-The sniffer now supports additional features:
+The sniffer now supports:
 
-- ✅ **GPS Integration (ATGM336H):** If detected, each scan result includes geographic coordinates (latitude & longitude).  
-- ✅ **PPS Pin Support:** Pulse-per-second (1PPS) from GPS is logged and used for millisecond-level timestamping.
-- ✅ **Client Detection per BSSID:** Promiscuous mode captures data packets to count connected Wi-Fi clients.
-- ✅ **Rolling Client History:** Optionally retain client MACs across scans.
-- ✅ **Signal Strength (RSSI):** Each AP shows real-time signal level.
-- ✅ **Security Type Detection:** Authentication method is displayed per network (e.g., WPA2, WPA3, OPEN).
-- ✅ **Optional Sorting:** Results can be sorted by signal strength via `#define SORT_BY_SIGNAL 1`.
+- ✅ **GPS Integration (ATGM336H):** If detected, each scan result includes geographic coordinates and GPS fix status  
+- ✅ **Client Detection per BSSID:** Promiscuous mode captures data packets to count connected Wi-Fi clients
+- ✅ **Rolling Client History:** Optionally retain client MACs across scans
+- ✅ **Signal Strength (RSSI):** Each AP shows real-time signal level
+- ✅ **Security Type Detection:** Displays network encryption (WPA2, WPA3, OPEN)
+- ✅ **Optional Sorting:** Sort by signal strength via `#define SORT_RESULTS_BY_RSSI 1`
 
-You can toggle some features at compile-time:
+Feature toggles in `main.c`:
 
 ```c
-#define RETAIN_CLIENTS_HISTORY 1  // 0 = clear clients on each scan
-#define SORT_BY_SIGNAL 1          // 1 = sort scan results by RSSI
+#define RETAIN_CLIENTS_HISTORY 1
+#define SORT_RESULTS_BY_RSSI 1
+#define MAX_APS 10
+#define MAX_CLIENTS 10
 ```
 
 Output example:
+
 ```
-| SSID           | Band | Chan | RSSI  | Cli | BSSID             | Security  | Latitude   | Longitude  | PPS [ms] |
-|----------------|------|------|-------|-----|-------------------|-----------|------------|------------|----------|
-| MyWiFi         | 5G   | 128  | -49   | 4   | 9A:2A:6F:...:DD   | WPA2/WPA3 | 51.12345   | 17.12345   | 5432     |
+| SSID                      | Band | Chan  | RSSI   | Cli  | BSSID             | Security   | Latitude     | Longitude    | GPS Fix |
+|---------------------------|------|-------|--------|------|-------------------|------------|--------------|--------------|---------|
+| MyWiFi                    | 2.4G | 11    | -48    | 0    | XX:XX:XX:XX:XX:XX | WPA3       | 51.09572     | 16.98904     | OK      |
 ```
 
 ---
 
 ## 🧠 How it works
 
-1. Performs a Wi-Fi scan (active scan) and collects AP info (SSID, channel, BSSID, RSSI)
-2. For each AP, switches to its channel and enters promiscuous mode
-3. Sniffs for `data` frames and counts unique client MAC addresses seen communicating with that BSSID
-4. After scanning all APs, displays a table in the console
+1. Performs a Wi-Fi scan (active)
+2. Collects SSID, RSSI, auth mode, channel, BSSID
+3. For each AP:
+   - Switches to its channel
+   - Enters promiscuous mode
+   - Captures `data` frames to detect unique clients
+4. Prints results to console with live GPS data if available
 
 ---
 
 ## 📁 Structure
 
-- `main.c` – core logic: scanning, sniffing, display
-- Uses ESP-IDF Wi-Fi APIs (`esp_wifi_...`) and `esp_wifi_set_promiscuous_rx_cb()` for sniffer mode
+- `main.c` – main loop, GPS parsing, Wi-Fi scan, sniffer callback
+- Uses ESP-IDF Wi-Fi APIs and `esp_wifi_set_promiscuous_rx_cb()`
+- UART communication with GPS (NMEA protocol)
 
 ---
 
 ## 🧭 Optional: GPS Integration (ATGM336H)
 
-This project optionally supports **GPS position logging** via the **ATGM336H** module.  
-The device outputs NMEA sentences (e.g. `$GPGGA`) over UART and a PPS signal for accurate timing.
+This project supports **GPS position logging** via the **ATGM336H** module using **UART**.  
+The ESP32-C5 communicates bidirectionally with the GPS module to obtain valid time and location data from NMEA sentences.
 
 ### 🔌 Wiring (ESP32-C5 DevKitC-1)
 
-| GPS Pin   | Connect to ESP32-C5 |
-|-----------|---------------------|
-| **TX**    | GPIO24              |
-| **PPS**   | GPIO23              |
-| **VCC**   | 3.3V                |
-| **GND**   | GND                 |
-| **RX**    | _Not connected_     |
+| GPS Pin | Connect to ESP32-C5        |
+|---------|----------------------------|
+| **TX**  | GPIO23 (to ESP32 RX)       |
+| **RX**  | GPIO24 (from ESP32 TX)     |
+| **VCC** | 3.3V                        |
+| **GND** | GND                         |
 
-> 📌 Only GPS TX (UART output) and PPS (Pulse-Per-Second) are used. GPS RX is not required.
+> ✅ **Both UART lines (TX and RX)** are required  
+> ❌ **PPS is not used** or needed
 
 ### ⚙️ Features
 
-- Automatically detects if GPS is present and active
-- Displays latest latitude/longitude if available
-- Shows last PPS timestamp (in milliseconds)
-- If GPS is not detected, displays "GPS: N/A"
+- Auto-detects GPS module on startup
+- Sends `$PMTK314,...` command to enable **RMC** and **GGA** sentences only
+- Parses:
+  - `$GPGGA` → **latitude, longitude, fix validity**
+  - `$GPRMC` → **UTC time/date** → sets ESP32 system RTC
+- GPS fix status shown as `OK` or `NOFIX` in table
+- Compatible with any NMEA-based GPS module
 
 ### 💡 Notes
 
-- UART baud rate: **9600**
-- PPS signal must be active (1 pulse per second) on rising edge
-- GPS fix may take time (especially indoors)
+- UART baud: **9600**
+- Fix may take up to 90s after cold boot
+- GGA fix is required for valid position data
 
 ---
 
 ## 📍 Notes
 
-- Limited to max 10 APs and 10 clients per BSSID (changeable via `#define`)
-- Sniffing duration per AP is configurable (default: 3000ms)
-- Requires active traffic to detect clients — idle clients may not be seen
+- Max APs: `#define MAX_APS` (default: 10)
+- Max clients per BSSID: `#define MAX_CLIENTS` (default: 10)
+- Sniff duration per AP: `#define SNIFF_TIME_MS` (default: 3000 ms)
+- Client detection requires active traffic — idle clients won't be seen
 
 ---
 
 ## 🛠️ TODO
 
-- [ ] Display summary on 1.8" SPI TFT screen (ST7735S)
-- [ ] Add rotary encoder support for navigating results
-- [ ] Live update of top APs with most clients
-- [X] GPS support
+- [ ] Show results on SPI TFT (ST7735S)
+- [ ] Rotary encoder to switch views
+- [ ] Add CSV export via UART or SD
+- [X] GPS support (ATGM336H)
 
-
-
-Apache License 2.0 – see [`LICENSE`](LICENSE) file for full details.
 ---
+
+**License:** Apache License 2.0  
+See [`LICENSE`](LICENSE) for full terms.
