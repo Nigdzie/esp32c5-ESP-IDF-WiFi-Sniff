@@ -16,6 +16,10 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 
+#include "sdkconfig.h"
+#include "OLEDDisplay.h"
+#include "driver/i2c.h"
+
 #define TAG "WiFiScanner"
 #define MAX_APS 10
 #define MAX_CLIENTS 10
@@ -25,6 +29,14 @@
 #define PPS_GPIO 23
 #define RETAIN_CLIENTS_HISTORY 1 // set to 0 to clear client list each scan
 #define SORT_RESULTS_BY_RSSI 1   // set to 0 to disable RSSI-based sorting
+
+#define _I2C_NUMBER(num) I2C_NUM_0
+#define I2C_NUMBER(num) _I2C_NUMBER(num)
+#define I2C_MASTER_SCL_IO 5									  /*!< gpio number for I2C master clock */
+#define I2C_MASTER_SDA_IO 4									  /*!< gpio number for I2C master data  */
+#define I2C_MASTER_NUM I2C_NUMBER(CONFIG_I2C_MASTER_PORT_NUM) /*!< I2C port number for master dev */
+
+SemaphoreHandle_t print_mux = NULL;
 
 static char gps_sentence[128] = {0};
 static float last_lat = 0.0, last_lon = 0.0;
@@ -38,6 +50,7 @@ typedef struct {
     uint8_t bssid[6];
     int client_count;
     wifi_auth_mode_t authmode;
+    char displayStr[150];
 } scan_result_t;
 
 static scan_result_t ap_results[MAX_APS];
@@ -162,6 +175,9 @@ static void wifi_sniffer_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
 }
 
+
+
+
 static int compare_rssi(const void *a, const void *b) {
     const scan_result_t *ra = (const scan_result_t *)a;
     const scan_result_t *rb = (const scan_result_t *)b;
@@ -238,6 +254,14 @@ void wifi_scan_task(void *pvParameters) {
                     client_counts[ap_result_count] = 0;
                 }
                 entry->client_count = client_counts[ap_result_count];
+
+       			//TODO: WTF is going on with integer formatting breaking oled display if done in the other task?
+                char temp_ssid[33];
+    			strncpy(temp_ssid, ap_results[i].ssid, sizeof(temp_ssid) - 1);
+	    		temp_ssid[sizeof(temp_ssid) - 1] = '\0'; // Ensure null termination
+                snprintf(ap_results[i].displayStr, sizeof(ap_results[i].displayStr), "%s(%d)", temp_ssid, ap_results[i].client_count);
+
+
                 ap_result_count++;
             }
         }
@@ -260,6 +284,48 @@ void wifi_scan_task(void *pvParameters) {
     }
 }
 
+
+static void i2c_small_text_list(void *arg)
+{
+	OLEDDisplay_t *oled = OLEDDisplay_init(I2C_MASTER_NUM, 0x78, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO);
+	OLEDDisplay_flipScreenVertically(oled);
+	OLEDDisplay_setTextAlignment(oled, TEXT_ALIGN_LEFT);
+	OLEDDisplay_setFont(oled, ArialMT_Plain_10);
+
+	int page = 0;			 
+	int networks_per_page = 4; 
+
+	while (1)
+	{
+		OLEDDisplay_clear(oled); 
+
+
+        //TODO: fix how appending an integer value is done
+        //char header[33];
+        //snprintf(header, sizeof(header), "Networks, page %d", page);
+        
+        OLEDDisplay_drawString(oled, 0, 00, "Networks");
+
+		for (int i = 0; i < networks_per_page; i++)
+		{
+			int index = page * networks_per_page + i;
+			if (index < ap_result_count)
+			{
+				OLEDDisplay_drawString(oled, 0, 15 + (i * 10), ap_results[index].displayStr);
+			}
+		}
+
+		OLEDDisplay_display(oled);			  
+		vTaskDelay(8000 / portTICK_PERIOD_MS); 
+
+		page++;
+		if (page * networks_per_page >= ap_result_count)
+		{
+			page = 0; 
+		}
+	}
+}
+
 void app_main(void) {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
@@ -275,4 +341,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
 
     xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
+
+    print_mux = xSemaphoreCreateMutex();
+	xTaskCreate(i2c_small_text_list, "i2c_test_task_0", 8192, (void *)0, 10, NULL);
 }
