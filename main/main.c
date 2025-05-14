@@ -21,6 +21,7 @@
 #define MAX_APS 10
 #define MAX_CLIENTS 10
 #define SNIFF_TIME_MS 3000
+#define SCAN_INTERVAL_SEC 60
 #define GPS_UART_NUM UART_NUM_1
 #define GPS_RXD 23
 #define GPS_TXD 24
@@ -34,6 +35,8 @@ static bool gps_available = false;
 static bool gps_fix_valid = false;
 static struct tm gps_time_tm = {0};
 static time_t gps_epoch_time = 0;
+
+bool gps_enabled = false;
 
 typedef struct {
     char ssid[33];
@@ -70,12 +73,14 @@ static bool detect_gps_presence(void) {
         if (len > 0) {
             buffer[len] = '\0';
             if (strstr(buffer, "$GP")) {
-                ESP_LOGI(TAG, "GPS module detected");
+                printf("GPS detected: YES\n");
+                gps_enabled = true;
                 return true;
             }
         }
     }
-    ESP_LOGW(TAG, "No GPS data detected - disabling GPS support");
+    printf("No GPS data detected - disabling GPS support\n");
+    gps_enabled = false;
     return false;
 }
 
@@ -247,18 +252,18 @@ static void print_scan_results(void) {
         qsort(ap_results, ap_result_count, sizeof(scan_result_t), compare_rssi);
     }
 
-    printf("\n| %-25s | %-4s | %-5s | %-6s | %-4s | %-17s | %-10s | %-12s | %-12s | %-7s |\n",
-           "SSID", "Band", "Chan", "RSSI", "Cli", "BSSID", "Security", "Latitude", "Longitude", "GPS Fix");
-    printf("|---------------------------|------|-------|--------|------|-------------------|------------|--------------|--------------|---------|\n");
+    if (gps_enabled) {
+        printf("\n| %-25s | %-4s | %-5s | %-6s | %-4s | %-17s | %-10s | %-12s | %-12s | %-7s |\n",
+               "SSID", "Band", "Chan", "RSSI", "Cli", "BSSID", "Security", "Latitude", "Longitude", "GPS Fix");
+        printf("|---------------------------|------|-------|--------|------|-------------------|------------|--------------|--------------|---------|\n");
+    } else {
+        printf("\n| %-25s | %-4s | %-5s | %-6s | %-4s | %-17s | %-10s |\n",
+               "SSID", "Band", "Chan", "RSSI", "Cli", "BSSID", "Security");
+        printf("|---------------------------|------|-------|--------|------|-------------------|------------|\n");
+    }
 
     for (int i = 0; i < ap_result_count; i++) {
         const char *band = (ap_results[i].channel <= 14) ? "2.4G" : "5G";
-
-        char lat_buf[16], lon_buf[16];
-        snprintf(lat_buf, sizeof(lat_buf), gps_fix_valid ? "%.5f" : "No fix", last_lat);
-        snprintf(lon_buf, sizeof(lon_buf), gps_fix_valid ? "%.5f" : "No fix", last_lon);
-        const char *fix_status = gps_fix_valid ? "OK" : "NOFIX";
-
         const char *auth_mode = "OPEN";
         switch (ap_results[i].authmode) {
             case WIFI_AUTH_WEP: auth_mode = "WEP"; break;
@@ -270,16 +275,29 @@ static void print_scan_results(void) {
             default: break;
         }
 
-        printf("| %-25s | %-4s | %-5d | %-6d | %-4d | %02X:%02X:%02X:%02X:%02X:%02X | %-10s | %-12s | %-12s | %-7s |\n",
-               ap_results[i].ssid, band, ap_results[i].channel, ap_results[i].rssi, ap_results[i].client_count,
-               ap_results[i].bssid[0], ap_results[i].bssid[1], ap_results[i].bssid[2],
-               ap_results[i].bssid[3], ap_results[i].bssid[4], ap_results[i].bssid[5],
-               auth_mode, lat_buf, lon_buf, fix_status);
+        if (gps_enabled) {
+            char lat_buf[16], lon_buf[16];
+            snprintf(lat_buf, sizeof(lat_buf), gps_fix_valid ? "%.5f" : "No fix", last_lat);
+            snprintf(lon_buf, sizeof(lon_buf), gps_fix_valid ? "%.5f" : "No fix", last_lon);
+            const char *fix_status = gps_fix_valid ? "OK" : "NOFIX";
+
+            printf("| %-25s | %-4s | %-5d | %-6d | %-4d | %02X:%02X:%02X:%02X:%02X:%02X | %-10s | %-12s | %-12s | %-7s |\n",
+                   ap_results[i].ssid, band, ap_results[i].channel, ap_results[i].rssi, ap_results[i].client_count,
+                   ap_results[i].bssid[0], ap_results[i].bssid[1], ap_results[i].bssid[2],
+                   ap_results[i].bssid[3], ap_results[i].bssid[4], ap_results[i].bssid[5],
+                   auth_mode, lat_buf, lon_buf, fix_status);
+        } else {
+            printf("| %-25s | %-4s | %-5d | %-6d | %-4d | %02X:%02X:%02X:%02X:%02X:%02X | %-10s |\n",
+                   ap_results[i].ssid, band, ap_results[i].channel, ap_results[i].rssi, ap_results[i].client_count,
+                   ap_results[i].bssid[0], ap_results[i].bssid[1], ap_results[i].bssid[2],
+                   ap_results[i].bssid[3], ap_results[i].bssid[4], ap_results[i].bssid[5],
+                   auth_mode);
+        }
     }
 }
 
+
 void wifi_scan_task(void *pvParameters) {
-    size_t free_heap;
     wifi_scan_config_t scan_cfg = {
         .ssid = NULL,
         .bssid = NULL,
@@ -324,7 +342,8 @@ void wifi_scan_task(void *pvParameters) {
         esp_wifi_set_promiscuous(false);
         print_scan_results();
         print_memory_stats();
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        printf("Next scan in %d seconds...\n", SCAN_INTERVAL_SEC);
+        vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL_SEC * 1000));
     }
 }
 
@@ -338,18 +357,36 @@ static void print_memory_stats(void) {
 }
 
 void app_main(void) {
+    printf("==== ESP32 WiFi Scanner Startup ====\n");
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    esp_log_level_set("phy", ESP_LOG_WARN);
+    esp_log_level_set("net80211", ESP_LOG_WARN);
+
+    printf("Initializing NVS storage...\n");
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    printf("Initializing network interface...\n");
     ESP_ERROR_CHECK(esp_netif_init());
+
+    printf("Creating event loop...\n");
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    printf("Initializing GPS UART...\n");
     init_gps_uart();
-    gps_available = detect_gps_presence();
-    send_gps_command("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28");
 
+    printf("Detecting GPS module...\n");
+    gps_available = detect_gps_presence();
+    if (gps_available) {
+        send_gps_command("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28");
+    } 
+
+    printf("Initializing WiFi driver...\n");
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    printf("Starting WiFi scan task...\n");
     xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
 }
