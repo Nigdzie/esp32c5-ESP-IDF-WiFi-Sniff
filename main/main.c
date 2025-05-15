@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
@@ -12,7 +14,6 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 
@@ -24,24 +25,32 @@
 #define MAX_APS 10
 #define MAX_CLIENTS 10
 #define SNIFF_TIME_MS 3000
+#define SCAN_INTERVAL_SEC 60
 #define GPS_UART_NUM UART_NUM_1
-#define GPS_RXD 24
-#define PPS_GPIO 23
-#define RETAIN_CLIENTS_HISTORY 1 // set to 0 to clear client list each scan
-#define SORT_RESULTS_BY_RSSI 1   // set to 0 to disable RSSI-based sorting
+#define GPS_RXD 23
+#define GPS_TXD 24
+#define RETAIN_CLIENTS_HISTORY 1
+#define SORT_RESULTS_BY_RSSI 1
+
 
 #define _I2C_NUMBER(num) I2C_NUM_0
 #define I2C_NUMBER(num) _I2C_NUMBER(num)
 #define I2C_MASTER_SCL_IO 5									  /*!< gpio number for I2C master clock */
 #define I2C_MASTER_SDA_IO 4									  /*!< gpio number for I2C master data  */
 #define I2C_MASTER_NUM I2C_NUMBER(CONFIG_I2C_MASTER_PORT_NUM) /*!< I2C port number for master dev */
-
 SemaphoreHandle_t print_mux = NULL;
+
+
+static void print_memory_stats(void);
 
 static char gps_sentence[128] = {0};
 static float last_lat = 0.0, last_lon = 0.0;
 static bool gps_available = false;
-static int64_t last_pps_time_us = 0;
+static bool gps_fix_valid = false;
+static struct tm gps_time_tm = {0};
+static time_t gps_epoch_time = 0;
+
+bool gps_enabled = false;
 
 typedef struct {
     char ssid[33];
@@ -57,24 +66,6 @@ static int ap_result_count = 0;
 static uint8_t client_macs[MAX_APS][MAX_CLIENTS][6];
 static int client_counts[MAX_APS] = {0};
 
-static void IRAM_ATTR pps_isr_handler(void* arg) {
-    last_pps_time_us = esp_timer_get_time();
-}
-
-static void init_pps_gpio(void) {
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = 1ULL << PPS_GPIO,
-        .pull_down_en = 0,
-        .pull_up_en = 1
-    };
-    gpio_config(&io_conf);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(PPS_GPIO, pps_isr_handler, NULL);
-    ESP_LOGI(TAG, "PPS interrupt configured on GPIO%d", PPS_GPIO);
-}
-
 static void init_gps_uart(void) {
     uart_config_t uart_config = {
         .baud_rate = 9600,
@@ -85,8 +76,8 @@ static void init_gps_uart(void) {
     };
     uart_driver_install(GPS_UART_NUM, 2048, 0, 0, NULL, 0);
     uart_param_config(GPS_UART_NUM, &uart_config);
-    uart_set_pin(GPS_UART_NUM, UART_PIN_NO_CHANGE, GPS_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    ESP_LOGI(TAG, "GPS UART initialized on RX=%d", GPS_RXD);
+    uart_set_pin(GPS_UART_NUM, GPS_TXD, GPS_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    ESP_LOGI(TAG, "GPS UART initialized on RX=%d, TX=%d", GPS_RXD, GPS_TXD);
 }
 
 static bool detect_gps_presence(void) {
@@ -96,19 +87,28 @@ static bool detect_gps_presence(void) {
         if (len > 0) {
             buffer[len] = '\0';
             if (strstr(buffer, "$GP")) {
-                ESP_LOGI(TAG, "GPS module detected");
+                printf("GPS detected: YES\n");
+                gps_enabled = true;
                 return true;
             }
         }
     }
-    ESP_LOGW(TAG, "No GPS data detected - disabling GPS support");
+    printf("No GPS data detected - disabling GPS support\n");
+    gps_enabled = false;
     return false;
 }
 
-static void parse_gpgga(const char *nmea) {
+static void send_gps_command(const char *cmd) {
+    const char *newline = "\r\n";
+    uart_write_bytes(GPS_UART_NUM, cmd, strlen(cmd));
+    uart_write_bytes(GPS_UART_NUM, newline, 2);
+    ESP_LOGI(TAG, "Sent GPS command: %s", cmd);
+}
+
+static void parse_gprmc(const char *nmea) {
     char buf[128];
-    strncpy(buf, nmea, sizeof(buf)-1);
-    buf[sizeof(buf)-1] = '\0';
+    strncpy(buf, nmea, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
 
     char *tokens[15] = {0};
     char *p = strtok(buf, ",");
@@ -118,29 +118,110 @@ static void parse_gpgga(const char *nmea) {
         p = strtok(NULL, ",");
     }
 
-    if (idx < 6 || tokens[2] == NULL || tokens[4] == NULL) return;
+    if (idx < 10 || tokens[1] == NULL || tokens[9] == NULL) return;
+
+    char *time_str = tokens[1];
+    char *date_str = tokens[9];
+
+    if (strlen(time_str) < 6 || strlen(date_str) != 6) return;
+
+    int hh = (time_str[0] - '0') * 10 + (time_str[1] - '0');
+    int mm = (time_str[2] - '0') * 10 + (time_str[3] - '0');
+    int ss = (time_str[4] - '0') * 10 + (time_str[5] - '0');
+
+    int dd = (date_str[0] - '0') * 10 + (date_str[1] - '0');
+    int mo = (date_str[2] - '0') * 10 + (date_str[3] - '0');
+    int yy = (date_str[4] - '0') * 10 + (date_str[5] - '0');
+
+    gps_time_tm.tm_year = yy + 100;
+    gps_time_tm.tm_mon = mo - 1;
+    gps_time_tm.tm_mday = dd;
+    gps_time_tm.tm_hour = hh;
+    gps_time_tm.tm_min = mm;
+    gps_time_tm.tm_sec = ss;
+    gps_time_tm.tm_isdst = 0;
+
+    gps_epoch_time = mktime(&gps_time_tm);
+    struct timeval tv = {
+        .tv_sec = gps_epoch_time,
+        .tv_usec = 0
+    };
+    settimeofday(&tv, NULL);
+
+    ESP_LOGI(TAG, "RTC updated from GPS: %04d-%02d-%02d %02d:%02d:%02d",
+             gps_time_tm.tm_year + 1900, gps_time_tm.tm_mon + 1, gps_time_tm.tm_mday,
+             gps_time_tm.tm_hour, gps_time_tm.tm_min, gps_time_tm.tm_sec);
+}
+
+static void parse_gpgga(const char *nmea) {
+    char buf[128];
+    strncpy(buf, nmea, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *tokens[15] = {0};
+    char *p = strtok(buf, ",");
+    int idx = 0;
+    while (p && idx < 15) {
+        tokens[idx++] = p;
+        p = strtok(NULL, ",");
+    }
+
+    if (idx < 7 || !tokens[2] || !tokens[3] || !tokens[4] || !tokens[5] || !tokens[6]) {
+        gps_fix_valid = false;
+        return;
+    }
+
+    if (tokens[6][0] == '0') {
+        gps_fix_valid = false;
+        return;
+    }
 
     float lat = atof(tokens[2]);
     float lon = atof(tokens[4]);
+
     int lat_deg = (int)(lat / 100);
     float lat_min = lat - (lat_deg * 100);
-    int lon_deg = (int)(lon / 100);
-    float lon_min = lon - (lon_deg * 100);
-
     last_lat = lat_deg + (lat_min / 60.0);
     if (tokens[3][0] == 'S') last_lat *= -1;
 
+    int lon_deg = (int)(lon / 100);
+    float lon_min = lon - (lon_deg * 100);
     last_lon = lon_deg + (lon_min / 60.0);
     if (tokens[5][0] == 'W') last_lon *= -1;
+
+    gps_fix_valid = true;
+
+    if (tokens[7]) {
+        int sat_count = atoi(tokens[7]);
+        ESP_LOGI(TAG, "Satellites in use: %d", sat_count);
+    }
+
+    ESP_LOGI(TAG, "Parsed GPS: %.5f, %.5f", last_lat, last_lon);
 }
 
 static void poll_gps_data(void) {
     if (!gps_available) return;
-    int len = uart_read_bytes(GPS_UART_NUM, (uint8_t *)gps_sentence, sizeof(gps_sentence)-1, 0);
+
+    int len = uart_read_bytes(GPS_UART_NUM, (uint8_t *)gps_sentence, sizeof(gps_sentence) - 1, 0);
     if (len > 0) {
         gps_sentence[len] = '\0';
-        if (strstr(gps_sentence, "$GPGGA")) {
-            parse_gpgga(gps_sentence);
+        //ESP_LOGI(TAG, "RAW GPS: %s", gps_sentence);
+
+        char *saveptr;
+        char *line = strtok_r(gps_sentence, "\r\n", &saveptr);
+        while (line) {
+            if (strstr(line, "GGA")) {
+                //ESP_LOGI(TAG, "GGA detected: %s", line);
+                parse_gpgga(line);
+            } else if (strstr(line, "RMC")) {
+                ESP_LOGI(TAG, "RMC detected: %s", line);
+                if (strchr(line, '*')) {
+                    parse_gprmc(line);
+                } else {
+                    //ESP_LOGW(TAG, "Ignored partial RMC line: %s", line);
+                }
+            }
+            line = strtok_r(NULL, "\r\n", &saveptr);
         }
     }
 }
@@ -188,18 +269,18 @@ static void print_scan_results(void) {
         qsort(ap_results, ap_result_count, sizeof(scan_result_t), compare_rssi);
     }
 
-    printf("\n| %-25s | %-4s | %-5s | %-6s | %-4s | %-17s | %-10s | %-12s | %-12s | %-10s |\n",
-           "SSID", "Band", "Chan", "RSSI", "Cli", "BSSID", "Security", "Latitude", "Longitude", "PPS [ms]");
-    printf("|---------------------------|------|-------|--------|------|-------------------|------------|--------------|--------------|------------|\n");
+    if (gps_enabled) {
+        printf("\n| %-25s | %-4s | %-5s | %-6s | %-4s | %-17s | %-10s | %-12s | %-12s | %-7s |\n",
+               "SSID", "Band", "Chan", "RSSI", "Cli", "BSSID", "Security", "Latitude", "Longitude", "GPS Fix");
+        printf("|---------------------------|------|-------|--------|------|-------------------|------------|--------------|--------------|---------|\n");
+    } else {
+        printf("\n| %-25s | %-4s | %-5s | %-6s | %-4s | %-17s | %-10s |\n",
+               "SSID", "Band", "Chan", "RSSI", "Cli", "BSSID", "Security");
+        printf("|---------------------------|------|-------|--------|------|-------------------|------------|\n");
+    }
 
     for (int i = 0; i < ap_result_count; i++) {
         const char *band = (ap_results[i].channel <= 14) ? "2.4G" : "5G";
-
-        char lat_buf[16], lon_buf[16], pps_buf[16];
-        snprintf(lat_buf, sizeof(lat_buf), gps_available ? "%.5f" : "GPS: N/A", last_lat);
-        snprintf(lon_buf, sizeof(lon_buf), gps_available ? "%.5f" : "GPS: N/A", last_lon);
-        snprintf(pps_buf, sizeof(pps_buf), gps_available ? "%lld" : "N/A", last_pps_time_us / 1000);
-
         const char *auth_mode = "OPEN";
         switch (ap_results[i].authmode) {
             case WIFI_AUTH_WEP: auth_mode = "WEP"; break;
@@ -211,13 +292,27 @@ static void print_scan_results(void) {
             default: break;
         }
 
-        printf("| %-25s | %-4s | %-5d | %-6d | %-4d | %02X:%02X:%02X:%02X:%02X:%02X | %-10s | %-12s | %-12s | %-10s |\n",
-               ap_results[i].ssid, band, ap_results[i].channel, ap_results[i].rssi, ap_results[i].client_count,
-               ap_results[i].bssid[0], ap_results[i].bssid[1], ap_results[i].bssid[2],
-               ap_results[i].bssid[3], ap_results[i].bssid[4], ap_results[i].bssid[5],
-               auth_mode, lat_buf, lon_buf, pps_buf);
+        if (gps_enabled) {
+            char lat_buf[16], lon_buf[16];
+            snprintf(lat_buf, sizeof(lat_buf), gps_fix_valid ? "%.5f" : "No fix", last_lat);
+            snprintf(lon_buf, sizeof(lon_buf), gps_fix_valid ? "%.5f" : "No fix", last_lon);
+            const char *fix_status = gps_fix_valid ? "OK" : "NOFIX";
+
+            printf("| %-25s | %-4s | %-5d | %-6d | %-4d | %02X:%02X:%02X:%02X:%02X:%02X | %-10s | %-12s | %-12s | %-7s |\n",
+                   ap_results[i].ssid, band, ap_results[i].channel, ap_results[i].rssi, ap_results[i].client_count,
+                   ap_results[i].bssid[0], ap_results[i].bssid[1], ap_results[i].bssid[2],
+                   ap_results[i].bssid[3], ap_results[i].bssid[4], ap_results[i].bssid[5],
+                   auth_mode, lat_buf, lon_buf, fix_status);
+        } else {
+            printf("| %-25s | %-4s | %-5d | %-6d | %-4d | %02X:%02X:%02X:%02X:%02X:%02X | %-10s |\n",
+                   ap_results[i].ssid, band, ap_results[i].channel, ap_results[i].rssi, ap_results[i].client_count,
+                   ap_results[i].bssid[0], ap_results[i].bssid[1], ap_results[i].bssid[2],
+                   ap_results[i].bssid[3], ap_results[i].bssid[4], ap_results[i].bssid[5],
+                   auth_mode);
+        }
     }
 }
+
 
 void wifi_scan_task(void *pvParameters) {
     wifi_scan_config_t scan_cfg = {
@@ -226,13 +321,9 @@ void wifi_scan_task(void *pvParameters) {
         .channel = 0,
         .show_hidden = true
     };
-
+    
     while (1) {
         poll_gps_data();
-
-        size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-        ESP_LOGI(TAG, "Free heap before scan: %d bytes", free_heap);
-
         esp_wifi_set_promiscuous(false);
         esp_wifi_scan_start(&scan_cfg, true);
 
@@ -267,12 +358,19 @@ void wifi_scan_task(void *pvParameters) {
 
         esp_wifi_set_promiscuous(false);
         print_scan_results();
-
-        free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-        ESP_LOGI(TAG, "Free heap after scan: %d bytes", free_heap);
-
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        print_memory_stats();
+        printf("Next scan in %d seconds...\n", SCAN_INTERVAL_SEC);
+        vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL_SEC * 1000));
     }
+}
+
+static void print_memory_stats(void) {
+    size_t free = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    size_t total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    size_t used = total - free;
+    float used_pct = ((float)used / total) * 100.0f;
+
+    printf("Memory: used %zu / %zu bytes (%.1f%% used)\n", used, total, used_pct);
 }
 
 
@@ -312,19 +410,37 @@ static void i2c_small_text_list(void *arg)
 }
 
 void app_main(void) {
+    printf("==== ESP32 WiFi Scanner Startup ====\n");
+    esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set("wifi", ESP_LOG_WARN);
+    esp_log_level_set("phy", ESP_LOG_WARN);
+    esp_log_level_set("net80211", ESP_LOG_WARN);
+
+    printf("Initializing NVS storage...\n");
     ESP_ERROR_CHECK(nvs_flash_init());
+
+    printf("Initializing network interface...\n");
     ESP_ERROR_CHECK(esp_netif_init());
+
+    printf("Creating event loop...\n");
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    printf("Initializing GPS UART...\n");
     init_gps_uart();
-    init_pps_gpio();
-    gps_available = detect_gps_presence();
 
+    printf("Detecting GPS module...\n");
+    gps_available = detect_gps_presence();
+    if (gps_available) {
+        send_gps_command("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28");
+    } 
+
+    printf("Initializing WiFi driver...\n");
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    printf("Starting WiFi scan task...\n");
     xTaskCreate(wifi_scan_task, "wifi_scan_task", 8192, NULL, 5, NULL);
 
     print_mux = xSemaphoreCreateMutex();
