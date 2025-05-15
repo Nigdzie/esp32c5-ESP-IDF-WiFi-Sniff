@@ -9,7 +9,7 @@
     },
     "idf.espIdfPathWin": "C:\\Users\\Pred\\esp\\master\\esp-idf",
     "idf.toolsPathWin": "C:\\Users\\Pred\\.espressif",
-    "idf.pythonInstallPath": "C:\\Users\\Pred\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+    "idf.pythonInstallPath": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
     "idf.monitorPort": "COM22",
     "idf.openOcdConfigs": [
         "board/esp32c5-builtin.cfg"

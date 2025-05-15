@@ -50,7 +50,6 @@ typedef struct {
     uint8_t bssid[6];
     int client_count;
     wifi_auth_mode_t authmode;
-    char displayStr[150];
 } scan_result_t;
 
 static scan_result_t ap_results[MAX_APS];
@@ -254,14 +253,6 @@ void wifi_scan_task(void *pvParameters) {
                     client_counts[ap_result_count] = 0;
                 }
                 entry->client_count = client_counts[ap_result_count];
-
-       			//TODO: WTF is going on with integer formatting breaking oled display if done in the other task?
-                char temp_ssid[33];
-    			strncpy(temp_ssid, ap_results[i].ssid, sizeof(temp_ssid) - 1);
-	    		temp_ssid[sizeof(temp_ssid) - 1] = '\0'; // Ensure null termination
-                snprintf(ap_results[i].displayStr, sizeof(ap_results[i].displayStr), "%s(%d)", temp_ssid, ap_results[i].client_count);
-
-
                 ap_result_count++;
             }
         }
@@ -297,13 +288,7 @@ static void i2c_small_text_list(void *arg)
 
 	while (1)
 	{
-		OLEDDisplay_clear(oled); 
-
-
-        //TODO: fix how appending an integer value is done
-        //char header[33];
-        //snprintf(header, sizeof(header), "Networks, page %d", page);
-        
+		OLEDDisplay_clear(oled);         
         OLEDDisplay_drawString(oled, 0, 00, "Networks");
 
 		for (int i = 0; i < networks_per_page; i++)
@@ -311,7 +296,7 @@ static void i2c_small_text_list(void *arg)
 			int index = page * networks_per_page + i;
 			if (index < ap_result_count)
 			{
-				OLEDDisplay_drawString(oled, 0, 15 + (i * 10), ap_results[index].displayStr);
+				OLEDDisplay_drawString(oled, 0, 15 + (i * 10), ap_results[index].ssid);
 			}
 		}
 
