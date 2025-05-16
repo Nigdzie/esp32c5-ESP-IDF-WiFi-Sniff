@@ -18,6 +18,7 @@ set(COMPONENTS
     spi_common     # SPI bus driver support
     sdmmc          # SD/MMC support (if you want SD/MMC mode too)
     driver         # core driver umbrella (needed by spi_common & sdspi)
+    oled           # oled screen
 )
 
 # Now bring in the normal IDF machinery
